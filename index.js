@@ -36,18 +36,27 @@ app.post("/api/download", (req, res) => {
   });
 
   engine.on("ready", () => {
-    const file = engine.files[0];
-    console.log("Downloading:", file.name);
+    console.log("Torrent ready. Files:");
 
-    const streamPath = path.join(DOWNLOAD_DIR, file.name);
-    const fileStream = fs.createWriteStream(streamPath);
+    engine.files.forEach(file => {
+      console.log(" -", file.name);
 
-    const stream = file.createReadStream();
-    stream.pipe(fileStream);
+      const filePath = path.join(DOWNLOAD_DIR, file.name);
+      const stream = file.createReadStream();
+      const writeStream = fs.createWriteStream(filePath);
 
-    stream.on("end", () => {
-      engine.destroy();
-      res.json({ name: file.name, url: `/files/${encodeURIComponent(file.name)}` });
+      stream.pipe(writeStream);
+
+      writeStream.on("finish", () => {
+        console.log(`✅ Finished writing: ${file.name}`);
+        // Send only one response (first file only, or change logic for multiple)
+        res.json({ name: file.name, url: `/files/${encodeURIComponent(file.name)}` });
+        engine.destroy(); // cleanup
+      });
+
+      writeStream.on("error", (err) => {
+        console.error(`❌ Error writing file ${file.name}:`, err.message);
+      });
     });
   });
 
