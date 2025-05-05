@@ -1,9 +1,13 @@
 {
-  "name": "torrent-api",
+  "name": "torrent-downloader-backend",
   "version": "1.0.0",
-  "main": "server.js",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
   "dependencies": {
     "express": "^4.18.2",
-    "webtorrent": "^1.7.0"
+    "webtorrent": "^1.10.0",
+    "cors": "^2.8.5"
   }
 }
