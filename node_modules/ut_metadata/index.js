@@ -1,15 +1,17 @@
 /*! ut_metadata. MIT License. WebTorrent LLC <https://webtorrent.io/opensource> */
-const { EventEmitter } = require('events')
-const bencode = require('bencode')
-const BitField = require('bitfield').default
-const debug = require('debug')('ut_metadata')
-const sha1 = require('simple-sha1')
+import { EventEmitter } from 'events'
+import bencode from 'bencode'
+import BitField from 'bitfield'
+import Debug from 'debug'
+import { hash, arr2text, concat } from 'uint8-util'
+
+const debug = Debug('ut_metadata')
 
 const MAX_METADATA_SIZE = 1E7 // 10 MB
 const BITFIELD_GROW = 1E3
 const PIECE_LENGTH = 1 << 14 // 16 KiB
 
-module.exports = metadata => {
+export default metadata => {
   class utMetadata extends EventEmitter {
     constructor (wire) {
       super()
@@ -27,7 +29,7 @@ module.exports = metadata => {
       // malicious peer can't make it grow to fill all memory.
       this._bitfield = new BitField(0, { grow: BITFIELD_GROW })
 
-      if (Buffer.isBuffer(metadata)) {
+      if (ArrayBuffer.isView(metadata)) {
         this.setMetadata(metadata)
       }
     }
@@ -60,7 +62,7 @@ module.exports = metadata => {
       let dict
       let trailer
       try {
-        const str = buf.toString()
+        const str = arr2text(buf)
         const trailerIndex = str.indexOf('ee') + 2
         dict = bencode.decode(str.substring(0, trailerIndex))
         trailer = buf.slice(trailerIndex)
@@ -110,7 +112,7 @@ module.exports = metadata => {
       this._fetching = false
     }
 
-    setMetadata (metadata) {
+    async setMetadata (metadata) {
       if (this._metadataComplete) return true
       debug('set metadata')
 
@@ -123,7 +125,7 @@ module.exports = metadata => {
       } catch (err) {}
 
       // check hash
-      if (this._infoHash && this._infoHash !== sha1.sync(metadata)) {
+      if (this._infoHash && this._infoHash !== await hash(metadata, 'hex')) {
         return false
       }
 
@@ -143,8 +145,8 @@ module.exports = metadata => {
 
     _send (dict, trailer) {
       let buf = bencode.encode(dict)
-      if (Buffer.isBuffer(trailer)) {
-        buf = Buffer.concat([buf, trailer])
+      if (ArrayBuffer.isView(trailer)) {
+        buf = concat([buf, trailer])
       }
       this._wire.extended('ut_metadata', buf)
     }
@@ -183,7 +185,7 @@ module.exports = metadata => {
       if (buf.length > PIECE_LENGTH || !this._fetching) {
         return
       }
-      buf.copy(this.metadata, piece * PIECE_LENGTH)
+      this.metadata.set(buf, piece * PIECE_LENGTH)
       this._bitfield.set(piece)
       this._checkDone()
     }
@@ -201,13 +203,13 @@ module.exports = metadata => {
 
     _requestPieces () {
       if (!this._fetching) return
-      this.metadata = Buffer.alloc(this._metadataSize)
+      this.metadata = new Uint8Array(this._metadataSize)
       for (let piece = 0; piece < this._numPieces; piece++) {
         this._request(piece)
       }
     }
 
-    _checkDone () {
+    async _checkDone () {
       let done = true
       for (let piece = 0; piece < this._numPieces; piece++) {
         if (!this._bitfield.get(piece)) {
@@ -218,7 +220,7 @@ module.exports = metadata => {
       if (!done) return
 
       // attempt to set metadata -- may fail sha1 check
-      const success = this.setMetadata(this.metadata)
+      const success = await this.setMetadata(this.metadata)
 
       if (!success) {
         this._failedMetadata()

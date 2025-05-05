@@ -1,9 +1,9 @@
-const net = require('net') // browser exclude
-const debugFactory = require('debug')
-const queueMicrotask = require('queue-microtask')
+import net from 'net' // browser exclude
+import debugFactory from 'debug'
+import queueMicrotask from 'queue-microtask'
 
-const Peer = require('./peer.js')
-const utp = require('./utp.js') // browser exclude
+import Peer from './peer.js'
+import utp from './utp.cjs' // browser exclude
 
 const debug = debugFactory('webtorrent:conn-pool')
 
@@ -16,7 +16,7 @@ const debug = debugFactory('webtorrent:conn-pool')
  *
  * @param {number} port
  */
-class ConnPool {
+export default class ConnPool {
   constructor (client) {
     debug('create pool (port %s)', client.torrentPort)
 
@@ -42,8 +42,10 @@ class ConnPool {
       this._client._destroy(err)
     }
 
-    this._onUTPError = () => {
+    this._onUTPError = (err) => {
       this._client.utp = false
+      this._client.emit('error', err)
+      if (!this._client.listening) this._onListening()
     }
 
     // Setup TCP
@@ -141,8 +143,8 @@ class ConnPool {
     wire.once('pe3', onPe3)
     wire.once('handshake', onHandshake)
 
-    function onPe3 (infoHashHash) {
-      const torrent = self._client._getByHash(infoHashHash)
+    async function onPe3 (infoHashHash) {
+      const torrent = await self._client._getByHash(infoHashHash)
       if (torrent) {
         peer.swarm = torrent
         torrent._addIncomingPeer(peer)
@@ -152,10 +154,10 @@ class ConnPool {
       }
     }
 
-    function onHandshake (infoHash, peerId) {
+    async function onHandshake (infoHash, peerId) {
       cleanupPending()
 
-      const torrent = self._client.get(infoHash)
+      const torrent = await self._client.get(infoHash)
       // only add incoming peer if didn't already do so in protocol encryption handshake
       if (torrent) {
         if (!peer.swarm) {
@@ -184,5 +186,3 @@ class ConnPool {
 ConnPool.UTP_SUPPORT = Object.keys(utp).length > 0
 
 function noop () {}
-
-module.exports = ConnPool

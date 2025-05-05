@@ -1,15 +1,23 @@
-const arrayRemove = require('unordered-array-remove')
-const bencode = require('bencode')
-const clone = require('clone')
-const compact2string = require('compact2string')
-const debug = require('debug')('bittorrent-tracker:http-tracker')
-const get = require('simple-get')
-const Socks = require('socks')
+import arrayRemove from 'unordered-array-remove'
+import bencode from 'bencode'
+import Debug from 'debug'
+import fetch from 'cross-fetch-ponyfill'
+import { bin2hex, hex2bin, arr2text, text2arr, arr2hex } from 'uint8-util'
 
-const common = require('../common')
-const Tracker = require('./tracker')
+import common from '../common.js'
+import Tracker from './tracker.js'
+import compact2string from 'compact2string'
 
+const debug = Debug('bittorrent-tracker:http-tracker')
 const HTTP_SCRAPE_SUPPORT = /\/(announce)[^/]*$/
+
+function abortTimeout (ms) {
+  const controller = new AbortController()
+  setTimeout(() => {
+    controller.abort()
+  }, ms).unref?.()
+  return controller
+}
 
 /**
  * HTTP torrent tracker client (for an individual tracker)
@@ -47,6 +55,8 @@ class HTTPTracker extends Tracker {
       peer_id: this.client._peerIdBinary,
       port: this.client._port
     })
+
+    if (params.left !== 0 && !params.left) params.left = 16384
     if (this._trackerId) params.trackerid = this._trackerId
 
     this._request(this.announceUrl, params, (err, data) => {
@@ -64,8 +74,8 @@ class HTTPTracker extends Tracker {
     }
 
     const infoHashes = (Array.isArray(opts.infoHash) && opts.infoHash.length > 0)
-      ? opts.infoHash.map(infoHash => infoHash.toString('binary'))
-      : (opts.infoHash && opts.infoHash.toString('binary')) || this.client._infoHashBinary
+      ? opts.infoHash.map(infoHash => hex2bin(infoHash))
+      : (opts.infoHash && hex2bin(opts.infoHash)) || this.client._infoHashBinary
     const params = {
       info_hash: infoHashes
     }
@@ -110,70 +120,73 @@ class HTTPTracker extends Tracker {
     }
   }
 
-  _request (requestUrl, params, cb) {
-    const self = this
+  async _request (requestUrl, params, cb) {
     const parsedUrl = new URL(requestUrl + (requestUrl.indexOf('?') === -1 ? '?' : '&') + common.querystringStringify(params))
     let agent
     if (this.client._proxyOpts) {
       agent = parsedUrl.protocol === 'https:' ? this.client._proxyOpts.httpsAgent : this.client._proxyOpts.httpAgent
       if (!agent && this.client._proxyOpts.socksProxy) {
-        agent = new Socks.Agent(clone(this.client._proxyOpts.socksProxy), (parsedUrl.protocol === 'https:'))
+        agent = this.client._proxyOpts.socksProxy
       }
+    }
+
+    const cleanup = () => {
+      if (!controller.signal.aborted) {
+        arrayRemove(this.cleanupFns, this.cleanupFns.indexOf(cleanup))
+        controller.abort()
+        controller = null
+      }
+      if (this.maybeDestroyCleanup) this.maybeDestroyCleanup()
     }
 
     this.cleanupFns.push(cleanup)
 
-    let request = get.concat({
-      url: parsedUrl.toString(),
-      agent,
-      timeout: common.REQUEST_TIMEOUT,
-      headers: {
-        'user-agent': this.client._userAgent || ''
-      }
-    }, onResponse)
-
-    function cleanup () {
-      if (request) {
-        arrayRemove(self.cleanupFns, self.cleanupFns.indexOf(cleanup))
-        request.abort()
-        request = null
-      }
-      if (self.maybeDestroyCleanup) self.maybeDestroyCleanup()
-    }
-
-    function onResponse (err, res, data) {
-      cleanup()
-      if (self.destroyed) return
-
+    let res
+    let controller = abortTimeout(common.REQUEST_TIMEOUT)
+    try {
+      res = await fetch(parsedUrl.toString(), {
+        agent,
+        signal: controller.signal,
+        dispatcher: agent,
+        headers: {
+          'user-agent': this.client._userAgent || ''
+        }
+      })
+      if (res.body.on) res.body.on('error', cb)
+    } catch (err) {
       if (err) return cb(err)
-      if (res.statusCode !== 200) {
-        return cb(new Error(`Non-200 response code ${res.statusCode} from ${self.announceUrl}`))
-      }
-      if (!data || data.length === 0) {
-        return cb(new Error(`Invalid tracker response from${self.announceUrl}`))
-      }
-
-      try {
-        data = bencode.decode(data)
-      } catch (err) {
-        return cb(new Error(`Error decoding tracker response: ${err.message}`))
-      }
-      const failure = data['failure reason']
-      if (failure) {
-        debug(`failure from ${requestUrl} (${failure})`)
-        return cb(new Error(failure))
-      }
-
-      const warning = data['warning message']
-      if (warning) {
-        debug(`warning from ${requestUrl} (${warning})`)
-        self.client.emit('warning', new Error(warning))
-      }
-
-      debug(`response from ${requestUrl}`)
-
-      cb(null, data)
     }
+    let data = new Uint8Array(await res.arrayBuffer())
+    cleanup()
+    if (this.destroyed) return
+
+    if (res.status !== 200) {
+      return cb(new Error(`Non-200 response code ${res.status} from ${this.announceUrl}`))
+    }
+    if (!data || data.length === 0) {
+      return cb(new Error(`Invalid tracker response from${this.announceUrl}`))
+    }
+
+    try {
+      data = bencode.decode(data)
+    } catch (err) {
+      return cb(new Error(`Error decoding tracker response: ${err.message}`))
+    }
+    const failure = data['failure reason'] && arr2text(data['failure reason'])
+    if (failure) {
+      debug(`failure from ${requestUrl} (${failure})`)
+      return cb(new Error(failure))
+    }
+
+    const warning = data['warning message'] && arr2text(data['warning message'])
+    if (warning) {
+      debug(`warning from ${requestUrl} (${warning})`)
+      this.client.emit('warning', new Error(warning))
+    }
+
+    debug(`response from ${requestUrl}`)
+
+    cb(null, data)
   }
 
   _onAnnounceResponse (data) {
@@ -188,15 +201,15 @@ class HTTPTracker extends Tracker {
 
     const response = Object.assign({}, data, {
       announce: this.announceUrl,
-      infoHash: common.binaryToHex(data.info_hash)
+      infoHash: bin2hex(data.info_hash || String(data.info_hash))
     })
     this.client.emit('update', response)
 
     let addrs
-    if (Buffer.isBuffer(data.peers)) {
+    if (ArrayBuffer.isView(data.peers)) {
       // tracker returned compact response
       try {
-        addrs = compact2string.multi(data.peers)
+        addrs = compact2string.multi(Buffer.from(data.peers))
       } catch (err) {
         return this.client.emit('warning', err)
       }
@@ -210,10 +223,10 @@ class HTTPTracker extends Tracker {
       })
     }
 
-    if (Buffer.isBuffer(data.peers6)) {
+    if (ArrayBuffer.isView(data.peers6)) {
       // tracker returned compact response
       try {
-        addrs = compact2string.multi6(data.peers6)
+        addrs = compact2string.multi6(Buffer.from(data.peers6))
       } catch (err) {
         return this.client.emit('warning', err)
       }
@@ -242,12 +255,14 @@ class HTTPTracker extends Tracker {
       return
     }
 
-    keys.forEach(infoHash => {
+    keys.forEach(_infoHash => {
       // TODO: optionally handle data.flags.min_request_interval
       // (separate from announce interval)
-      const response = Object.assign(data[infoHash], {
+      const infoHash = _infoHash.length !== 20 ? arr2hex(text2arr(_infoHash)) : bin2hex(_infoHash)
+
+      const response = Object.assign(data[_infoHash], {
         announce: this.announceUrl,
-        infoHash: common.binaryToHex(infoHash)
+        infoHash
       })
       this.client.emit('scrape', response)
     })
@@ -256,4 +271,4 @@ class HTTPTracker extends Tracker {
 
 HTTPTracker.prototype.DEFAULT_ANNOUNCE_INTERVAL = 30 * 60 * 1000 // 30 minutes
 
-module.exports = HTTPTracker
+export default HTTPTracker
